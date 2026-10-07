@@ -1,0 +1,8 @@
+node_modules
+target
+dist
+test-results
+playwright-report
+package-lock.json
+Cargo.lock
+*.wasm

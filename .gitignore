@@ -1,0 +1,11 @@
+node_modules/
+target/
+dist/
+web/public/poltergeist.wasm
+playwright-report/
+test-results/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.log
