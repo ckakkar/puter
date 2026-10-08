@@ -19,6 +19,9 @@ impl Vec2 {
     pub fn length(self) -> f32 {
         self.dot(self).sqrt()
     }
+    pub fn length_squared(self) -> f32 {
+        self.dot(self)
+    }
     pub fn normalized(self) -> Self {
         let l = self.length();
         if l > 1e-8 {

@@ -1,4 +1,5 @@
-use crate::{Body, Shape, Vec2};
+use crate::{Body, Shape, Vec2, MAX_SIDES};
+use std::f32::consts::{PI, TAU};
 
 #[derive(Clone, Copy, Debug)]
 pub struct GeometryContact {
@@ -6,6 +7,15 @@ pub struct GeometryContact {
     pub normal: Vec2,
     pub penetration: f32,
     pub feature: u32,
+}
+
+/// Local vertex `i` of a regular polygon. Vertices run counter-clockwise and the
+/// closing edge (last vertex to first) is horizontal, so an unrotated polygon
+/// rests on a flat bottom.
+pub fn polygon_vertex(radius: f32, sides: u32, i: u32) -> Vec2 {
+    let n = sides as f32;
+    let theta = -PI / 2.0 + PI / n + TAU * i as f32 / n;
+    Vec2::new(radius * theta.cos(), radius * theta.sin())
 }
 
 pub fn bounds(b: &Body) -> (Vec2, Vec2) {
@@ -18,8 +28,32 @@ pub fn bounds(b: &Body) -> (Vec2, Vec2) {
                 s.abs() * half.x + c.abs() * half.y,
             )
         }
+        Shape::Polygon { radius, sides } => {
+            let mut lo = Vec2::new(f32::INFINITY, f32::INFINITY);
+            let mut hi = -lo;
+            for i in 0..sides {
+                let v = polygon_vertex(radius, sides, i).rotate(b.angle);
+                lo = Vec2::new(lo.x.min(v.x), lo.y.min(v.y));
+                hi = Vec2::new(hi.x.max(v.x), hi.y.max(v.y));
+            }
+            return (b.position + lo, b.position + hi);
+        }
     };
     (b.position - e, b.position + e)
+}
+
+/// Whether world point `p` lies inside the body.
+pub fn contains(b: &Body, p: Vec2) -> bool {
+    let q = (p - b.position).rotate(-b.angle);
+    match b.shape {
+        Shape::Circle { radius } => q.dot(q) <= radius * radius,
+        Shape::Box { half } => q.x.abs() <= half.x && q.y.abs() <= half.y,
+        Shape::Polygon { radius, sides } => (0..sides).all(|i| {
+            let v1 = polygon_vertex(radius, sides, i);
+            let v2 = polygon_vertex(radius, sides, (i + 1) % sides);
+            (v2 - v1).cross(q - v1) >= 0.0
+        }),
+    }
 }
 
 pub fn collide(a: &Body, b: &Body) -> Vec<GeometryContact> {
@@ -39,15 +73,19 @@ pub fn collide(a: &Body, b: &Body) -> Vec<GeometryContact> {
             }]
         }
         (Shape::Box { half }, Shape::Circle { radius }) => box_circle(a, b, half, radius),
-        (Shape::Circle { radius }, Shape::Box { half }) => {
-            let mut contacts = box_circle(b, a, half, radius);
-            for c in &mut contacts {
-                c.normal = -c.normal;
-            }
-            contacts
-        }
+        (Shape::Circle { radius }, Shape::Box { half }) => flipped(box_circle(b, a, half, radius)),
         (Shape::Box { half: ha }, Shape::Box { half: hb }) => box_box(a, b, ha, hb),
+        (Shape::Polygon { .. }, Shape::Circle { radius }) => polygon_circle(a, b, radius),
+        (Shape::Circle { radius }, Shape::Polygon { .. }) => flipped(polygon_circle(b, a, radius)),
+        _ => polygon_polygon(a, b),
     }
+}
+
+fn flipped(mut contacts: Vec<GeometryContact>) -> Vec<GeometryContact> {
+    for c in &mut contacts {
+        c.normal = -c.normal;
+    }
+    contacts
 }
 
 fn box_circle(a: &Body, b: &Body, half: Vec2, radius: f32) -> Vec<GeometryContact> {
@@ -120,6 +158,13 @@ fn clip(vertices: Vec<Vertex>, normal: Vec2, offset: f32, feature: u32) -> Vec<V
     }
     out
 }
+
+/// Cache key for a box-box manifold point. Every field gets its own bit range:
+/// vertex (0..4) | incident face (0..4) << 2 | reference axis (0..4) << 4 | flip << 6.
+pub(crate) fn box_feature(axis: usize, incident: usize, flip: bool, vertex: u32) -> u32 {
+    ((flip as u32) << 6) | ((axis as u32) << 4) | ((incident as u32) << 2) | vertex
+}
+
 fn box_box(a: &Body, b: &Body, ha: Vec2, hb: Vec2) -> Vec<GeometryContact> {
     let ax = Vec2::new(1.0, 0.0).rotate(a.angle);
     let ay = ax.perp();
@@ -184,12 +229,7 @@ fn box_box(a: &Body, b: &Body, ha: Vec2, hb: Vec2) -> Vec<GeometryContact> {
     ];
     let vertices = clip(vertices, tangent, face.dot(tangent) + side_extent, 2);
     let vertices = clip(vertices, -tangent, -face.dot(tangent) + side_extent, 3);
-    let base = ((index as u32) * 8 + inc_index as u32) * 8
-        + if rnormal.dot(axes[index]) < 0.0 {
-            128
-        } else {
-            0
-        };
+    let flip = rnormal.dot(axes[index]) < 0.0;
     vertices
         .into_iter()
         .filter_map(|v| {
@@ -198,8 +238,171 @@ fn box_box(a: &Body, b: &Body, ha: Vec2, hb: Vec2) -> Vec<GeometryContact> {
                 point: v.p - rnormal * (separation * 0.5),
                 normal,
                 penetration: (-separation).max(0.0),
-                feature: base + v.feature,
+                feature: box_feature(index, inc_index, flip, v.feature),
             })
         })
         .collect()
+}
+
+/// A convex outline in world space: counter-clockwise vertices with outward edge normals.
+struct Poly {
+    v: [Vec2; MAX_SIDES as usize],
+    n: [Vec2; MAX_SIDES as usize],
+    count: usize,
+}
+impl Poly {
+    fn of(b: &Body) -> Self {
+        let mut local = [Vec2::ZERO; MAX_SIDES as usize];
+        let count = match b.shape {
+            Shape::Box { half } => {
+                local[..4].copy_from_slice(&[
+                    Vec2::new(-half.x, -half.y),
+                    Vec2::new(half.x, -half.y),
+                    Vec2::new(half.x, half.y),
+                    Vec2::new(-half.x, half.y),
+                ]);
+                4
+            }
+            Shape::Polygon { radius, sides } => {
+                for i in 0..sides {
+                    local[i as usize] = polygon_vertex(radius, sides, i);
+                }
+                sides as usize
+            }
+            Shape::Circle { .. } => unreachable!("circles are not polygons"),
+        };
+        let mut poly = Poly {
+            v: [Vec2::ZERO; MAX_SIDES as usize],
+            n: [Vec2::ZERO; MAX_SIDES as usize],
+            count,
+        };
+        for i in 0..count {
+            let e = local[(i + 1) % count] - local[i];
+            poly.v[i] = b.position + local[i].rotate(b.angle);
+            poly.n[i] = Vec2::new(e.y, -e.x).normalized().rotate(b.angle);
+        }
+        poly
+    }
+    fn next(&self, i: usize) -> usize {
+        (i + 1) % self.count
+    }
+}
+
+/// The edge of `p1` along which `p2` is least deep, and that separation.
+fn max_separation(p1: &Poly, p2: &Poly) -> (usize, f32) {
+    let mut best = (0, f32::NEG_INFINITY);
+    for i in 0..p1.count {
+        let s = (0..p2.count)
+            .map(|j| p1.n[i].dot(p2.v[j] - p1.v[i]))
+            .fold(f32::INFINITY, f32::min);
+        if s > best.1 {
+            best = (i, s);
+        }
+    }
+    best
+}
+
+fn polygon_polygon(a: &Body, b: &Body) -> Vec<GeometryContact> {
+    let pa = Poly::of(a);
+    let pb = Poly::of(b);
+    let (edge_a, sep_a) = max_separation(&pa, &pb);
+    if sep_a > 0.0 {
+        return vec![];
+    }
+    let (edge_b, sep_b) = max_separation(&pb, &pa);
+    if sep_b > 0.0 {
+        return vec![];
+    }
+    // Same hysteresis as box_box: prefer A's face unless B's is clearly shallower.
+    let flip = sep_b > sep_a + 0.001;
+    let (reference, incident, edge) = if flip {
+        (&pb, &pa, edge_b)
+    } else {
+        (&pa, &pb, edge_a)
+    };
+    let rnormal = reference.n[edge];
+    let inc_edge = (0..incident.count)
+        .min_by(|&i, &j| {
+            rnormal
+                .dot(incident.n[i])
+                .total_cmp(&rnormal.dot(incident.n[j]))
+        })
+        .unwrap_or(0);
+    let v11 = reference.v[edge];
+    let v12 = reference.v[reference.next(edge)];
+    let tangent = (v12 - v11).normalized();
+    let vertices = vec![
+        Vertex {
+            p: incident.v[inc_edge],
+            feature: 0,
+        },
+        Vertex {
+            p: incident.v[incident.next(inc_edge)],
+            feature: 1,
+        },
+    ];
+    let vertices = clip(vertices, -tangent, -tangent.dot(v11), 2);
+    let vertices = clip(vertices, tangent, tangent.dot(v12), 3);
+    let normal = if flip { -rnormal } else { rnormal };
+    // flip | reference edge | incident edge | vertex, each in its own bit range.
+    let base = ((flip as u32) << 10) | ((edge as u32) << 6) | ((inc_edge as u32) << 2);
+    vertices
+        .into_iter()
+        .filter_map(|v| {
+            let separation = (v.p - v11).dot(rnormal);
+            (separation <= 0.002).then_some(GeometryContact {
+                point: v.p - rnormal * (separation * 0.5),
+                normal,
+                penetration: (-separation).max(0.0),
+                feature: base | v.feature,
+            })
+        })
+        .collect()
+}
+
+/// Polygon `a` against circle `b`; the normal points from the polygon to the circle.
+fn polygon_circle(a: &Body, b: &Body, radius: f32) -> Vec<GeometryContact> {
+    let poly = Poly::of(a);
+    let c = b.position;
+    let mut edge = 0;
+    let mut separation = f32::NEG_INFINITY;
+    for i in 0..poly.count {
+        let s = poly.n[i].dot(c - poly.v[i]);
+        if s > radius {
+            return vec![];
+        }
+        if s > separation {
+            separation = s;
+            edge = i;
+        }
+    }
+    let n = poly.n[edge];
+    let face = |separation: f32| GeometryContact {
+        point: c - n * separation,
+        normal: n,
+        penetration: radius - separation,
+        feature: edge as u32,
+    };
+    if separation < 1e-6 {
+        return vec![face(separation)];
+    }
+    let v1 = poly.v[edge];
+    let v2 = poly.v[poly.next(edge)];
+    let corner = |vertex: Vec2, index: usize| {
+        let d = c - vertex;
+        let l = d.length();
+        (l <= radius).then_some(GeometryContact {
+            point: vertex,
+            normal: d.normalized(),
+            penetration: radius - l,
+            feature: 16 + index as u32,
+        })
+    };
+    if (c - v1).dot(v2 - v1) <= 0.0 {
+        corner(v1, edge).into_iter().collect()
+    } else if (c - v2).dot(v1 - v2) <= 0.0 {
+        corner(v2, poly.next(edge)).into_iter().collect()
+    } else {
+        vec![face(separation)]
+    }
 }
