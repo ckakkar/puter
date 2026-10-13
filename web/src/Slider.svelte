@@ -36,7 +36,11 @@
   function commit() {
     const typed = Number(field.value);
     if (field.value.trim() === '' || !Number.isFinite(typed)) field.value = format(value);
-    else onchange(Math.min(inputMax, Math.max(inputMin, typed)));
+    else {
+      const clamped = Math.min(inputMax, Math.max(inputMin, typed));
+      field.value = format(clamped);
+      onchange(clamped);
+    }
   }
 </script>
 

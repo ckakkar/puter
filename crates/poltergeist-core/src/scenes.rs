@@ -1,7 +1,7 @@
 //! Preset experiments. Body IDs follow creation order, so keep existing scenes stable.
 use crate::{JointKind, Shape, Vec2, World};
 
-pub const SCENE_COUNT: u32 = 8;
+pub const SCENE_COUNT: u32 = 11;
 
 impl World {
     pub fn load_scene(&mut self, scene: u32) {
@@ -21,6 +21,9 @@ impl World {
             5 => self.spring_lattices(),
             6 => self.mechanisms(),
             7 => {}
+            8 => self.sweep_lab(),
+            9 => self.cradle(),
+            10 => self.stress_lab(),
             _ => self.tower(),
         }
         // Side walls keep normal-speed interactions within the laboratory.
@@ -40,6 +43,59 @@ impl World {
             b.angle = angle;
             b.friction = friction;
             b.restitution = restitution;
+        }
+    }
+    fn sweep_lab(&mut self) {
+        self.gravity = Vec2::ZERO;
+        for row in 0..3 {
+            let y = 1.6 + row as f32 * 2.2;
+            let wall = self.add(
+                Shape::Box {
+                    half: Vec2::new(0.015, 0.8),
+                },
+                Vec2::new(2.0, y),
+                0.0,
+            );
+            self.set(wall, row as f32 * 0.08, 0.0, 0.9);
+            let ball = self.add(Shape::Circle { radius: 0.08 }, Vec2::new(-6.0, y), 0.5);
+            self.set(ball, 0.0, 0.0, 0.9);
+            self.set_motion(ball, 0.0, Vec2::new(40.0 + row as f32 * 40.0, 0.0), 0.0);
+        }
+    }
+    fn cradle(&mut self) {
+        for i in 0..5 {
+            let x = -1.8 + i as f32 * 0.9;
+            let pivot = Vec2::new(x, 6.5);
+            let p = if i == 0 {
+                Vec2::new(x - 1.4, 6.5 - (9.0_f32 - 1.4 * 1.4).sqrt())
+            } else {
+                Vec2::new(x, 3.5)
+            };
+            let ball = self.add(Shape::Circle { radius: 0.445 }, p, 2.0);
+            self.set(ball, 0.0, 0.0, 0.98);
+            self.add_joint(JointKind::Rod, ball, 0, p, pivot);
+        }
+    }
+    fn stress_lab(&mut self) {
+        for row in 0..10 {
+            for col in 0..16 {
+                let shape = match col % 3 {
+                    0 => Shape::Circle { radius: 0.2 },
+                    1 => Shape::Box {
+                        half: Vec2::new(0.2, 0.2),
+                    },
+                    _ => Shape::Polygon {
+                        radius: 0.24,
+                        sides: 5,
+                    },
+                };
+                let id = self.add(
+                    shape,
+                    Vec2::new(-6.0 + col as f32 * 0.8, 0.5 + row as f32 * 0.65),
+                    0.25,
+                );
+                self.set(id, 0.0, 0.6, 0.05);
+            }
         }
     }
     fn tower(&mut self) {

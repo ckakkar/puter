@@ -5,6 +5,24 @@
   import Inspector from './Inspector.svelte';
   import type { InspectorActions } from './Inspector.svelte';
   import EnergyChart from './EnergyChart.svelte';
+  import Library from './Library.svelte';
+  import CommandPalette from './CommandPalette.svelte';
+  import type { Command } from './CommandPalette.svelte';
+  import {
+    loadLibrary,
+    saveExperiment,
+    removeExperiment,
+    renameExperiment,
+    loadRecovery,
+    saveRecovery,
+    clearRecovery,
+  } from './library';
+  import type { Experiment, Recovery } from './library';
+  import { createSceneLink, readSceneLink } from './share';
+  import { interpolate } from './presentation';
+  import { materials, materialMass } from './materials';
+  import type { MaterialId } from './materials';
+  import { registerOffline } from './offline';
   import type { EnergySample } from './EnergyChart.svelte';
   import {
     BOX,
@@ -78,6 +96,24 @@
       sub: 'Build your own',
       description: 'Floor, walls, nothing else. Place bodies, connect them, and see what happens.',
     },
+    {
+      name: 'High-speed lab',
+      sub: 'Swept circles & thin walls',
+      description:
+        'Three tiny circles launch at 40, 80, and 120 m/s toward thin fixed walls. Inspect their swept impacts.',
+    },
+    {
+      name: 'Cradle study',
+      sub: 'Pendulums & elastic impacts',
+      description:
+        'Five hanging spheres transfer momentum through a chain. Explore the numerical limits of elastic contacts.',
+    },
+    {
+      name: 'Stress chamber',
+      sub: '160 mixed shapes',
+      description:
+        'A repeatable mix of circles, boxes, and polygons. Compare tick cost, sleeping, and contact density on your device.',
+    },
   ];
   const tools: { id: Tool; label: string; key: string; icon: string }[] = [
     { id: 'select', label: 'Select & drag', key: 'V', icon: 'select' },
@@ -86,6 +122,7 @@
     { id: 'polygon', label: 'Add polygon', key: 'P', icon: 'polygon' },
     { id: 'impulse', label: 'Apply impulse', key: 'I', icon: 'impulse' },
     { id: 'joint', label: 'Connect bodies', key: 'J', icon: 'joint' },
+    { id: 'measure', label: 'Measure distance', key: 'M', icon: 'measure' },
   ];
   const jointInfo: Record<JointKind, { label: string; hint: string }> = {
     rod: { label: 'Rod', hint: 'Holds two anchors at a fixed distance' },
@@ -114,6 +151,9 @@
     { key: `${mod}Z`, label: 'Undo' },
     { key: `⇧${mod}Z`, label: 'Redo' },
     { key: `${mod}D`, label: 'Duplicate body' },
+    { key: `${mod}K`, label: 'Search commands' },
+    { key: `${mod}S`, label: 'Saved experiments' },
+    { key: 'ARROWS ↵', label: 'Place from keyboard' },
     { key: 'DEL', label: 'Delete body' },
     { key: 'Q  E', label: 'Rotate body 15°' },
     { key: 'S', label: 'Static placement' },
@@ -129,6 +169,7 @@
   type Point = { x: number; y: number };
   type Gesture =
     | { kind: 'none' }
+    | { kind: 'measure'; x: number; y: number }
     | { kind: 'spring'; id: number }
     | {
         kind: 'move';
@@ -168,6 +209,8 @@
     placeStatic: false,
     sides: 5,
     jointKind: 'rod',
+    snapGrid: false,
+    smoothMotion: true,
   });
 
   let engine: Engine;
@@ -175,6 +218,32 @@
   let viewport: HTMLDivElement;
   let fileInput: HTMLInputElement;
   let helpDialog: HTMLDialogElement;
+  let libraryDialog: HTMLDialogElement;
+  let shareDialog: HTMLDialogElement;
+  let commandDialog: HTMLDialogElement;
+  let libraryOpen = $state(false);
+  let commandsOpen = $state(false);
+  let shareOpen = $state(false);
+  let experiments: Experiment[] = $state.raw(loadLibrary());
+  let recovery: Recovery | null = $state.raw(null);
+  let experimentName = $state('');
+  let shareLink = $state('');
+  let shareBusy = $state(false);
+  let offlineReady = $state(false);
+  let updateWorker: ServiceWorker | null = $state.raw(null);
+  let online = $state(navigator.onLine);
+  let autosaveStatus = $state('RECOVERY ON');
+  let snapGrid = $state(prefs.snapGrid);
+  let smoothMotion = $state(prefs.smoothMotion);
+  let material: MaterialId = $state('default');
+  let measurements: Segment[] = $state.raw([]);
+  let objectSearch = $state('');
+  let recording = $state(false);
+  let recorder: MediaRecorder | null = null;
+  let recordingStream: MediaStream | null = null;
+  let recordingTimer: ReturnType<typeof setTimeout>;
+  let latestFrame = emptyFrame();
+  let previousFrame = latestFrame;
   let ready = $state(false);
   let fatal = $state('');
   let frame: Frame = $state.raw(emptyFrame());
@@ -234,7 +303,17 @@
     frame.historyLength > 1 && frame.historyCursor < frame.historyLength - 1,
   );
   const rewindSeconds = $derived((frame.historyLength - 1 - frame.historyCursor) * DT);
-  const currentTitle = $derived(customScene ? 'Custom experiment' : scenes[scene].name);
+  const currentTitle = $derived(
+    customScene ? experimentName || 'Custom experiment' : scenes[scene].name,
+  );
+  const modalOpen = $derived(help || libraryOpen || shareOpen || commandsOpen);
+  const visibleObjects = $derived(
+    frame.bodies.filter((b) =>
+      `${shapeName(b)} ${b.id} ${b.mass === 0 ? 'static' : b.awake ? 'awake' : 'sleeping'}`
+        .toLowerCase()
+        .includes(objectSearch.toLowerCase()),
+    ),
+  );
   const currentDescription = $derived(
     customScene
       ? 'An imported or edited experiment. Reset restores how it began.'
@@ -247,6 +326,8 @@
         : 'Paused: drag bodies to rearrange them. Drag empty space to pan, scroll to zoom.';
     if (tool === 'impulse')
       return 'Drag from a body toward where it should go. Longer arrows push harder.';
+    if (tool === 'measure')
+      return 'Drag between two points to measure a world-space distance. Measurements do not change the simulation.';
     if (tool === 'joint') {
       if (jointKind === 'pin')
         return 'Click a body to pin it to whatever is behind it, or to the world.';
@@ -260,18 +341,35 @@
   const fmt = (n: number, digits = 2) => (Number.isFinite(n) ? n.toFixed(digits) : '—');
 
   $effect(() => {
-    savePrefs({ overlays: { ...overlays }, speed, placeStatic, sides, jointKind });
+    savePrefs({
+      overlays: { ...overlays },
+      speed,
+      placeStatic,
+      sides,
+      jointKind,
+      snapGrid,
+      smoothMotion,
+    });
   });
 
+  $effect(() => {
+    if (selected && ready) document.querySelector('.right-panel')?.scrollTo({ top: 0 });
+  });
   function notify(message: string) {
     toast = message;
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => (toast = ''), 4000);
   }
   function sync() {
-    if (ready) frame = engine.read();
+    if (ready) {
+      frame = engine.read();
+      latestFrame = frame;
+      previousFrame = frame;
+      settings = { ...engine.settings };
+    }
   }
   function liveBody(id: number): Body | undefined {
+    if (!ready) return undefined;
     return engine.read().bodies.find((b) => b.id === id);
   }
 
@@ -283,6 +381,7 @@
       sceneIndex: scene,
       custom: customScene,
       initial: initialCustomScene,
+      name: experimentName,
     };
   }
   function record(label: string, key = '', before: Checkpoint | (() => Checkpoint) = checkpoint) {
@@ -295,7 +394,7 @@
     endGesture();
     pendingLink = null;
     try {
-      engine.load(doc, settings);
+      engine.load(doc, doc);
     } catch (error) {
       notify(error instanceof Error ? error.message : 'Unable to restore that step.');
       return false;
@@ -304,6 +403,7 @@
     scene = c.sceneIndex;
     customScene = c.custom;
     initialCustomScene = c.initial;
+    experimentName = c.name ?? '';
     accumulator = 0;
     sync();
     if (!frame.bodies.some((b) => b.id === selected)) selected = 0;
@@ -333,6 +433,12 @@
     engine.configure(settings);
     scene = index;
     customScene = false;
+    experimentName = '';
+    objectSearch = '';
+    measurements = [];
+    trails.clear();
+    energy.length = 0;
+    lastTick = -1;
     nudged = false;
     initialCustomScene = '';
     selected = 0;
@@ -340,6 +446,7 @@
     follow = false;
     accumulator = 0;
     sync();
+    resetView();
     if (before) record(`Load ${scenes[index].name}`, '', before);
   }
   function resetScene() {
@@ -365,6 +472,7 @@
   function seek(index: number) {
     if (gesture.kind === 'spring') endGesture();
     engine.api.history_seek(index);
+    engine.api.drag_end();
     sync();
   }
   function stepForward() {
@@ -388,6 +496,7 @@
   }
   function configure(change: Partial<Settings>) {
     if (!ready) return;
+    record('Edit world settings', `settings:${Object.keys(change).join()}`);
     settings = { ...settings, ...change };
     engine.configure(settings);
     sync();
@@ -398,7 +507,15 @@
     if (gesture.kind === 'spring' && ready) engine.api.drag_end();
     gesture = { kind: 'none' };
   }
-  function setTool(next: Tool) {
+  function abortPointers() {
+    endGesture();
+    for (const id of touches.keys())
+      if (canvas?.hasPointerCapture(id)) canvas.releasePointerCapture(id);
+    touches.clear();
+    pointer.inside = false;
+    hovered = 0;
+  }
+  function setTool(next: Tool, focus = true) {
     if (next === 'joint' && tool === 'joint') {
       // Pressing J again cycles through connection types.
       setJointKind(jointKinds[(jointKinds.indexOf(jointKind) + 1) % jointKinds.length]);
@@ -407,12 +524,18 @@
     tool = next;
     pendingLink = null;
     endGesture();
+    if (focus && window.matchMedia('(max-width:620px)').matches)
+      viewport?.scrollIntoView({ block: 'center' });
   }
   function setJointKind(kind: JointKind) {
     jointKind = kind;
     pendingLink = null;
   }
   function ghostFor(start: Point, end: Point, dragged: boolean, square: boolean): Ghost {
+    if (snapGrid) {
+      start = { x: Math.round(start.x * 4) / 4, y: Math.round(start.y * 4) / 4 };
+      end = { x: Math.round(end.x * 4) / 4, y: Math.round(end.y * 4) / 4 };
+    }
     const kind = tool === 'circle' ? CIRCLE : tool === 'box' ? BOX : POLYGON;
     const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
     const reach = Math.hypot(end.x - start.x, end.y - start.y);
@@ -435,12 +558,14 @@
       return;
     }
     const before = checkpoint();
-    const mass = g.fixed ? 0 : massFor(g.kind, g.a, g.b);
+    const mass = g.fixed ? 0 : materialMass(material, g);
     const id = engine.api.spawn(0, g.kind, g.x, g.y, g.a, g.b, mass);
     if (!id) {
       notify('The chamber is full (256 bodies). Delete a body to make room.');
       return;
     }
+    const m = materials.find((m) => m.id === material) ?? materials[0];
+    engine.api.properties(id, mass, m.friction, m.restitution);
     record(`Add ${shapeName(g).toLowerCase()}`, '', before);
     selected = id;
     sync();
@@ -452,6 +577,7 @@
     const jx = (p.x - anchor.x) * 5,
       jy = (p.y - anchor.y) * 5;
     if (Math.hypot(jx, jy) < 1e-3) return;
+    record('Apply impulse');
     engine.api.impulse(g.id, anchor.x, anchor.y, jx, jy);
     sync();
   }
@@ -571,6 +697,39 @@
     sync();
   }
   const inspector: InspectorActions = {
+    position(change) {
+      const b = body && liveBody(body.id);
+      if (!b) return;
+      record('Set position', `position:${b.id}`);
+      engine.api.place(b.id, change.x ?? b.x, change.y ?? b.y);
+      sync();
+    },
+    velocity(change) {
+      const b = body && liveBody(body.id);
+      if (!b) return;
+      record('Set motion', `motion:${b.id}`);
+      engine.api.motion(
+        b.id,
+        b.angle,
+        change.vx ?? b.vx,
+        change.vy ?? b.vy,
+        change.omega ?? b.omega,
+      );
+      sync();
+    },
+    material(id) {
+      const b = body && liveBody(body.id);
+      if (!b) return;
+      const m = materials.find((m) => m.id === id) ?? materials[0];
+      record(`Apply ${m.name} material`);
+      engine.api.properties(
+        b.id,
+        b.mass === 0 ? 0 : materialMass(id, b),
+        m.friction,
+        m.restitution,
+      );
+      sync();
+    },
     property(key, value) {
       const b = body && liveBody(body.id);
       if (!b) return;
@@ -613,6 +772,7 @@
     const target =
       f.bodies.find((b) => b.mass > 0 && b.kind === CIRCLE) ?? f.bodies.find((b) => b.mass > 0);
     if (target) {
+      record('Nudge experiment');
       engine.api.impulse(target.id, target.x, target.y, 16, 3);
       selected = target.id;
       nudged = true;
@@ -701,6 +861,10 @@
       return;
     }
     if (event.button !== 0) return;
+    if (tool === 'measure') {
+      gesture = { kind: 'measure', x: p.x, y: p.y };
+      return;
+    }
     const id = engine.api.pick(p.x, p.y);
     if (tool === 'select') {
       if (!id) gesture = pan(true);
@@ -779,6 +943,7 @@
         record('Move body', '', g.before);
       }
       engine.api.place(g.id, p.x + g.dx, p.y + g.dy);
+      sync();
     } else if (g.kind === 'pan') {
       camera = panBy(camera, view, s.x - g.lastX, s.y - g.lastY);
       g.lastX = s.x;
@@ -807,7 +972,10 @@
     const g = gesture;
     gesture = { kind: 'none' };
     if (g.kind === 'spring') engine.api.drag_end();
-    else if (g.kind === 'move' && g.moved) sync();
+    else if (g.kind === 'measure' && !cancelled) {
+      if (Math.hypot(p.x - g.x, p.y - g.y) > 0.01)
+        measurements = [...measurements.slice(-9), { x1: g.x, y1: g.y, x2: p.x, y2: p.y }];
+    } else if (g.kind === 'move' && g.moved) sync();
     else if (g.kind === 'pan' && !g.moved && g.deselect && !cancelled) selected = 0;
     else if (g.kind === 'place' && !cancelled) {
       const dragged = Math.hypot(s.x - g.sx, s.y - g.sy) > 6;
@@ -825,6 +993,333 @@
     camera = zoomAt(camera, view, s.x, s.y, factor);
     updateView();
   }
+
+  // Persistence and exports ---------------------------------------------------------------
+  function openLibrary() {
+    if (!ready) return;
+    abortPointers();
+    experiments = loadLibrary();
+    libraryOpen = true;
+    libraryDialog.showModal();
+  }
+  function closeLibrary() {
+    libraryOpen = false;
+    libraryDialog.close();
+  }
+  function saveNamed(name: string) {
+    try {
+      experiments = saveExperiment(name, engine.snapshot());
+      notify(`Saved “${name.trim()}” in your library.`);
+    } catch (error) {
+      notify((error as Error).message);
+    }
+  }
+  function deleteNamed(id: string) {
+    try {
+      experiments = removeExperiment(id);
+      notify('Saved experiment removed.');
+    } catch (error) {
+      notify((error as Error).message);
+    }
+  }
+  function renameNamed(id: string, name: string) {
+    try {
+      experiments = renameExperiment(id, name);
+      notify('Experiment renamed.');
+    } catch (error) {
+      notify((error as Error).message);
+    }
+  }
+  function loadDocument(doc: SceneDoc, name: string, label: string) {
+    const before = checkpoint();
+    endGesture();
+    engine.load(doc);
+    settings = { ...engine.settings };
+    record(label, '', before);
+    customScene = true;
+    experimentName = name;
+    initialCustomScene = JSON.stringify(doc);
+    running = false;
+    selected = 0;
+    pendingLink = null;
+    accumulator = 0;
+    measurements = [];
+    trails.clear();
+    energy.length = 0;
+    lastTick = -1;
+    resetView();
+    sync();
+  }
+  function openNamed(entry: Experiment) {
+    try {
+      loadDocument(entry.scene, entry.name, 'Open saved experiment');
+      closeLibrary();
+      notify(`Opened “${entry.name}”.`);
+    } catch (error) {
+      notify((error as Error).message);
+    }
+  }
+  function recover() {
+    if (!recovery) return;
+    try {
+      loadDocument(recovery.scene, recovery.name, 'Restore session');
+      recovery = null;
+      notify('Your previous experiment is restored.');
+    } catch (error) {
+      notify((error as Error).message);
+    }
+  }
+  function dismissRecovery() {
+    recovery = null;
+    clearRecovery();
+  }
+  function autosave() {
+    if (!ready || fatal || recovery) return;
+    autosaveStatus = saveRecovery(currentTitle, engine.snapshot())
+      ? 'RECOVERY SAVED'
+      : 'EXPORT TO KEEP YOUR WORK';
+  }
+  async function openShare() {
+    if (!ready) return;
+    abortPointers();
+    shareOpen = true;
+    shareBusy = true;
+    shareLink = '';
+    shareDialog.showModal();
+    try {
+      shareLink = await createSceneLink(currentTitle, engine.snapshot());
+    } catch (error) {
+      notify((error as Error).message);
+    } finally {
+      shareBusy = false;
+    }
+  }
+  function closeShare() {
+    shareOpen = false;
+    shareDialog.close();
+  }
+  async function copyLink() {
+    try {
+      await navigator.clipboard.writeText(shareLink);
+      notify('Scene link copied.');
+    } catch {
+      notify('Select the link and copy it with your keyboard.');
+    }
+  }
+  async function fullscreen() {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await document.documentElement.requestFullscreen();
+    } catch {
+      notify('Fullscreen is unavailable in this browser.');
+    }
+  }
+  function updateApp() {
+    if (recovery) {
+      notify('Restore or dismiss your previous recovery before updating.');
+      return;
+    }
+    if (!saveRecovery(currentTitle, engine.snapshot())) {
+      notify('Browser storage is unavailable. Export your scene before updating.');
+      return;
+    }
+    autosave();
+    navigator.serviceWorker.addEventListener('controllerchange', () => location.reload(), {
+      once: true,
+    });
+    updateWorker?.postMessage('ACTIVATE_UPDATE');
+  }
+  function exportEnergy() {
+    if (!energy.length) {
+      notify('Run the experiment first to collect energy samples.');
+      return;
+    }
+    const rows = [
+      'tick,time_s,kinetic_J,potential_J,total_J',
+      ...energy.map((s) => [s.tick, s.t, s.k, s.p, s.k + s.p].join(',')),
+    ];
+    download(new Blob([rows.join('\n')], { type: 'text/csv' }), 'poltergeist-energy.csv');
+    notify('Energy samples exported as CSV.');
+  }
+  function clearMoving() {
+    if (!ready) return;
+    const moving = latestFrame.bodies.filter((b) => b.mass > 0);
+    if (!moving.length) return;
+    record('Clear moving bodies');
+    endGesture();
+    for (const b of moving) engine.api.remove(b.id);
+    selected = 0;
+    measurements = [];
+    sync();
+    notify('Moving bodies cleared. Undo restores them.');
+  }
+  function recordVideo() {
+    if (recording) {
+      recorder?.stop();
+      return;
+    }
+    if (!('MediaRecorder' in window) || !canvas.captureStream) {
+      notify('Video capture is unavailable here. Save a PNG instead.');
+      return;
+    }
+    try {
+      const type = [
+        'video/webm;codecs=vp9',
+        'video/webm;codecs=vp8',
+        'video/mp4',
+        'video/webm',
+      ].find((t) => MediaRecorder.isTypeSupported(t));
+      if (!type) throw new Error('No supported video recording format. Save a PNG instead.');
+      recordingStream = canvas.captureStream(30);
+      recorder = new MediaRecorder(recordingStream, {
+        mimeType: type,
+        videoBitsPerSecond: 3_000_000,
+      });
+      const chunks: Blob[] = [];
+      let bytes = 0;
+      recorder.ondataavailable = (e) => {
+        if (e.data.size) {
+          chunks.push(e.data);
+          bytes += e.data.size;
+          if (bytes > 50_000_000 && recorder?.state === 'recording') recorder.stop();
+        }
+      };
+      recorder.onstop = () => {
+        clearTimeout(recordingTimer);
+        recordingStream?.getTracks().forEach((t) => t.stop());
+        recordingStream = null;
+        recording = false;
+        if (chunks.length)
+          download(
+            new Blob(chunks, { type }),
+            `poltergeist-recording.${type.includes('mp4') ? 'mp4' : 'webm'}`,
+          );
+        notify('Recording saved.');
+        recorder = null;
+      };
+      recorder.onerror = () => {
+        notify('Video capture failed.');
+        if (recorder?.state === 'recording') recorder.stop();
+      };
+      recorder.start(1000);
+      recording = true;
+      recordingTimer = setTimeout(() => {
+        if (recorder?.state === 'recording') recorder.stop();
+      }, 30_000);
+      notify('Recording the chamber (up to 30 seconds). Click again to save.');
+    } catch (error) {
+      recordingStream?.getTracks().forEach((t) => t.stop());
+      recordingStream = null;
+      notify((error as Error).message);
+    }
+  }
+  function openCommands() {
+    if (!ready) return;
+    abortPointers();
+    commandsOpen = true;
+    commandDialog.showModal();
+  }
+  function closeCommands() {
+    commandsOpen = false;
+    commandDialog.close();
+  }
+  const commands: Command[] = $derived([
+    ...scenes.map((s, i) => ({
+      id: `scene-${i}`,
+      label: s.name,
+      detail: 'Load experiment',
+      icon: 'folder',
+      run: () => {
+        loadScene(i);
+        resetView();
+      },
+    })),
+    ...tools.map((t) => ({
+      id: `tool-${t.id}`,
+      label: t.label,
+      detail: `Tool · ${t.key}`,
+      icon: t.icon,
+      run: () => setTool(t.id),
+    })),
+    {
+      id: 'pause',
+      label: running ? 'Pause simulation' : 'Play simulation',
+      detail: 'Space',
+      icon: running ? 'pause' : 'play',
+      run: pause,
+    },
+    {
+      id: 'library',
+      label: 'Saved experiments',
+      detail: 'Save or open your library',
+      icon: 'save',
+      run: openLibrary,
+    },
+    {
+      id: 'share',
+      label: 'Share experiment',
+      detail: 'Create a link containing this scene',
+      icon: 'share',
+      run: () => void openShare(),
+    },
+    {
+      id: 'json',
+      label: 'Export scene',
+      detail: 'Portable JSON file',
+      icon: 'download',
+      run: exportScene,
+    },
+    {
+      id: 'image',
+      label: 'Save image',
+      detail: 'PNG of the chamber',
+      icon: 'image',
+      run: saveImage,
+    },
+    {
+      id: 'csv',
+      label: 'Export energy CSV',
+      detail: 'Download recent telemetry',
+      icon: 'download',
+      run: exportEnergy,
+    },
+    {
+      id: 'video',
+      label: recording ? 'Stop recording' : 'Record video',
+      detail: 'Capture up to 30 seconds',
+      icon: 'video',
+      run: recordVideo,
+    },
+    {
+      id: 'clear',
+      label: 'Clear moving bodies',
+      detail: 'Keep scenery; undoable',
+      icon: 'trash',
+      run: clearMoving,
+    },
+    {
+      id: 'measure-clear',
+      label: 'Clear measurements',
+      detail: 'Remove ruler annotations',
+      icon: 'measure',
+      run: () => (measurements = []),
+    },
+    {
+      id: 'fit',
+      label: 'Reset camera',
+      detail: 'Return to the laboratory',
+      icon: 'fit',
+      run: resetView,
+    },
+    {
+      id: 'full',
+      label: 'Toggle fullscreen',
+      detail: 'Expand the laboratory',
+      icon: 'fullscreen',
+      run: () => void fullscreen(),
+    },
+    { id: 'help', label: 'Help & shortcuts', detail: 'Field guide', icon: 'help', run: openHelp },
+  ]);
 
   // Files ----------------------------------------------------------------------------------
   function download(blob: Blob, name: string) {
@@ -865,6 +1360,7 @@
       record('Import scene', '', before);
       initialCustomScene = text;
       customScene = true;
+      experimentName = '';
       running = false;
       selected = 0;
       pendingLink = null;
@@ -888,7 +1384,17 @@
     );
   }
   function keydown(event: KeyboardEvent) {
-    if (isTextEntry(event.target) || help || !ready) return;
+    if (
+      (event.metaKey || event.ctrlKey) &&
+      event.key.toLowerCase() === 'k' &&
+      ready &&
+      !modalOpen
+    ) {
+      event.preventDefault();
+      openCommands();
+      return;
+    }
+    if (isTextEntry(event.target) || modalOpen || !ready) return;
     const key = event.key.toLowerCase();
     if ((event.metaKey || event.ctrlKey) && !event.altKey) {
       if (key === 'z') {
@@ -901,11 +1407,29 @@
       } else if (key === 'd') {
         event.preventDefault();
         duplicate();
+      } else if (key === 's') {
+        event.preventDefault();
+        openLibrary();
       }
       // Leave every other browser shortcut (reload, find, …) alone.
       return;
     }
     if (event.altKey || event.metaKey || event.ctrlKey) return;
+    if (event.target === canvas && shapeTools.includes(tool)) {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        placeBody(ghostFor(pointer, pointer, false, event.shiftKey));
+        return;
+      }
+      if (event.key.startsWith('Arrow')) {
+        event.preventDefault();
+        const amount = event.shiftKey ? 0.05 : 0.25;
+        pointer.inside = true;
+        pointer.x += event.key === 'ArrowRight' ? amount : event.key === 'ArrowLeft' ? -amount : 0;
+        pointer.y += event.key === 'ArrowUp' ? amount : event.key === 'ArrowDown' ? -amount : 0;
+        return;
+      }
+    }
     const target = event.target instanceof HTMLElement ? event.target : null;
     const control = target?.matches('button, input, select') ?? false;
     if (event.code === 'Space') {
@@ -957,6 +1481,7 @@
     }
   }
   function openHelp() {
+    abortPointers();
     help = true;
     helpDialog.showModal();
   }
@@ -1041,25 +1566,36 @@
       if (!alive) return;
       const elapsed = animationTime ? Math.min((now - animationTime) / 1000, 0.1) : 0;
       animationTime = now;
-      if (ready && running && !document.hidden && !help) {
+      if (ready && running && !document.hidden && !modalOpen) {
         accumulator = Math.min(accumulator + elapsed * speed, 8 / 60);
         const start = performance.now();
         let count = 0;
         while (accumulator >= DT && count < 8) {
-          engine.api.step(DT);
+          previousFrame = latestFrame;
+          try {
+            engine.api.step(DT);
+            latestFrame = engine.read();
+          } catch {
+            running = false;
+            ready = false;
+            fatal = 'The simulation stopped. Reload to restore the most recent recovery snapshot.';
+            break;
+          }
+          trace(latestFrame);
           accumulator -= DT;
           count++;
         }
         if (count) simMs = simMs * 0.8 + ((performance.now() - start) / count) * 0.2;
       } else accumulator = 0;
-      const current = ready ? engine.read() : emptyFrame();
+      const current = latestFrame;
       if (follow) {
         const b = current.bodies.find((b) => b.id === selected);
         if (b) {
+          const blend = 1 - Math.exp(-12 * elapsed);
           camera = {
             ...camera,
-            x: camera.x + (b.x - camera.x) * 0.18,
-            y: camera.y + (b.y - camera.y) * 0.18,
+            x: camera.x + (b.x - camera.x) * blend,
+            y: camera.y + (b.y - camera.y) * blend,
           };
           view = viewFor(canvasWidth, canvasHeight, camera);
         } else follow = false;
@@ -1089,7 +1625,14 @@
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       render(ctx, {
-        frame: current,
+        frame:
+          smoothMotion && running && !modalOpen
+            ? interpolate(previousFrame, current, accumulator / DT)
+            : current,
+        measurements:
+          gesture.kind === 'measure'
+            ? [...measurements, { x1: gesture.x, y1: gesture.y, x2: pointer.x, y2: pointer.y }]
+            : measurements,
         view,
         selected,
         hovered,
@@ -1101,20 +1644,45 @@
     };
     raf = requestAnimationFrame(loop);
     Engine.load()
-      .then((value) => {
+      .then(async (value) => {
         if (!alive) return;
         engine = value;
         ready = true;
         loadScene(0, false);
+        try {
+          const shared = await readSceneLink(location.hash);
+          if (!alive) return;
+          if (shared) {
+            loadDocument(shared.scene, shared.name, 'Open shared experiment');
+            undoStack.clear();
+            canUndo = false;
+            canRedo = false;
+            notify('Shared experiment loaded. Press play to begin.');
+          } else recovery = loadRecovery();
+        } catch (error) {
+          notify((error as Error).message);
+          recovery = loadRecovery();
+        }
       })
       .catch((error) => {
         fatal = error.message;
       });
     const visibility = () => {
+      autosave();
       accumulator = 0;
       animationTime = 0;
-      if (gesture.kind === 'spring') endGesture();
+      abortPointers();
     };
+    const autosaveTimer = setInterval(autosave, 3000);
+    const network = () => (online = navigator.onLine);
+    window.addEventListener('online', network);
+    window.addEventListener('offline', network);
+    window.addEventListener('pagehide', autosave);
+    const storage = () => (experiments = loadLibrary());
+    window.addEventListener('storage', storage);
+    registerOffline((worker) => (updateWorker = worker))
+      .then((value) => (offlineReady = value))
+      .catch(() => {});
     const pointerInput = () => (lastInput = 'pointer');
     const keyboardInput = (e: KeyboardEvent) => {
       if (!['Shift', 'Control', 'Alt', 'Meta'].includes(e.key)) lastInput = 'keyboard';
@@ -1129,6 +1697,18 @@
     document.addEventListener('visibilitychange', visibility);
     window.addEventListener('blur', visibility);
     return () => {
+      autosave();
+      clearInterval(autosaveTimer);
+      clearTimeout(recordingTimer);
+      if (recorder) {
+        recorder.onstop = null;
+        if (recorder.state === 'recording') recorder.stop();
+      }
+      recordingStream?.getTracks().forEach((t) => t.stop());
+      window.removeEventListener('online', network);
+      window.removeEventListener('offline', network);
+      window.removeEventListener('pagehide', autosave);
+      window.removeEventListener('storage', storage);
       alive = false;
       cancelAnimationFrame(raf);
       observer.disconnect();
@@ -1164,7 +1744,29 @@
     </a>
     <span class="topbar-rule"></span><span class="topbar-caption">AN INTERACTIVE PHYSICS LAB</span>
     <div class="topbar-actions">
-      <span class="build-label">EXPERIMENTAL / V0.2</span>
+      <span class="build-label">PHYSICS LAB / V0.3</span>
+      <button
+        class="icon-button"
+        onclick={openCommands}
+        disabled={!ready}
+        aria-label="Search commands"
+        title="Command menu · ⌘K"><Icon name="command" size={17} /></button
+      >
+      <button
+        class="text-button"
+        onclick={openLibrary}
+        disabled={!ready}
+        aria-label="Saved experiments"
+        title="Save & open experiments · ⌘S"
+        ><Icon name="folder" size={16} /><span>Library</span></button
+      >
+      <button
+        class="icon-button"
+        onclick={openShare}
+        disabled={!ready}
+        aria-label="Share experiment"
+        title="Share experiment"><Icon name="share" size={17} /></button
+      >
       <button
         class="icon-button"
         onclick={undo}
@@ -1198,12 +1800,39 @@
       >
       <button
         class="icon-button"
+        class:recording
+        onclick={recordVideo}
+        disabled={!ready}
+        aria-label={recording ? 'Stop recording' : 'Record video'}
+        title="Record chamber video (up to 30 s)"><Icon name="video" size={17} /></button
+      >
+      <button
+        class="icon-button"
+        onclick={fullscreen}
+        aria-label="Toggle fullscreen"
+        title="Fullscreen"><Icon name="fullscreen" size={17} /></button
+      >
+      <button
+        class="icon-button"
         onclick={openHelp}
         title="Help & shortcuts · ?"
         aria-label="Help & shortcuts"><Icon name="help" size={18} /></button
       >
     </div>
   </header>
+
+  {#if recovery}<div class="recovery-banner" role="status">
+      <span>Your last experiment is saved: <strong>{recovery.name}</strong></span><button
+        onclick={recover}>Restore session</button
+      ><button class="icon-button" onclick={dismissRecovery} aria-label="Dismiss recovery"
+        ><Icon name="close" size={14} /></button
+      >
+    </div>{/if}
+  {#if updateWorker}<div class="recovery-banner" role="status">
+      <span>A new version is ready. Your scene will be saved before updating.</span><button
+        onclick={updateApp}>Update app</button
+      >
+    </div>{/if}
 
   <main class="lab-layout">
     <aside class="left-panel">
@@ -1272,10 +1901,10 @@
           <h2>{currentTitle}</h2>
           <p class="scene-description">{currentDescription}</p>
         </div>
-        <span class="status" class:paused={!running || help} class:replay={rewound}
+        <span class="status" class:paused={!running || modalOpen} class:replay={rewound}
           ><span></span>{rewound
             ? `REPLAY −${rewindSeconds.toFixed(2)} S`
-            : running && !help
+            : running && !modalOpen
               ? 'SIMULATING'
               : 'PAUSED'}</span
         >
@@ -1283,6 +1912,7 @@
       <div class="viewport" bind:this={viewport}>
         <canvas
           bind:this={canvas}
+          tabindex="0"
           aria-label="Interactive physics chamber. Use toolbox buttons to place bodies. Select a body in the Objects list to inspect it."
           onpointerdown={pointerDown}
           onpointermove={pointerMove}
@@ -1295,6 +1925,12 @@
           <div class="overlay-row">
             {#if shapeTools.includes(tool)}
               <div class="tool-options" role="group" aria-label="Placement options">
+                <select
+                  class="material-select"
+                  aria-label="Placement material"
+                  bind:value={material}
+                  >{#each materials as m}<option value={m.id}>{m.name}</option>{/each}</select
+                >
                 <div class="segmented">
                   <button
                     class:active={!placeStatic}
@@ -1322,6 +1958,13 @@
                     >
                   </div>
                 {/if}
+              </div>
+            {:else if tool === 'measure'}<div class="tool-options">
+                <span class="measurement-summary"
+                  >{measurements.length} measurement{measurements.length === 1 ? '' : 's'}</span
+                ><button class="text-button" onclick={() => (measurements = [])}
+                  >Clear measurements</button
+                >
               </div>
             {:else if tool === 'joint'}
               <div class="tool-options" role="group" aria-label="Connection type">
@@ -1441,9 +2084,21 @@
     </section>
 
     <aside class="right-panel">
-      <Inspector {body} contacts={bodyContacts} joints={bodyJoints} actions={inspector} />
+      <Inspector
+        body={ready ? body : undefined}
+        contacts={bodyContacts}
+        joints={bodyJoints}
+        actions={inspector}
+      />
       <section class="panel-section energy-section">
-        <div class="section-label">ENERGY <span>LAST 10 S</span></div>
+        <div class="section-label">
+          ENERGY <button
+            class="icon-button"
+            onclick={exportEnergy}
+            title="Export energy CSV"
+            aria-label="Export energy CSV"><Icon name="download" size={13} /></button
+          >
+        </div>
         <EnergyChart samples={energy} version={energyVersion} />
       </section>
       <section class="panel-section settings">
@@ -1479,6 +2134,20 @@
             aria-label="Let resting bodies sleep"
           /><span class="toggle-track"></span></label
         >
+        <label class="toggle-row"
+          ><span class="overlay-dot"></span><span>Interpolate motion</span><input
+            type="checkbox"
+            bind:checked={smoothMotion}
+            aria-label="Interpolate motion"
+          /><span class="toggle-track"></span></label
+        >
+        <label class="toggle-row"
+          ><span class="overlay-dot"></span><span>Snap placement to 0.25 m</span><input
+            type="checkbox"
+            bind:checked={snapGrid}
+            aria-label="Snap placement to grid"
+          /><span class="toggle-track"></span></label
+        >
         <div class="data-row muted">
           <span>Fixed timestep</span><strong>1/60 <small>s</small></strong>
         </div>
@@ -1486,13 +2155,21 @@
       </section>
       <section class="panel-section objects-section">
         <div class="section-label">OBJECTS <span>{frame.bodies.length}</span></div>
+        <label class="search-field object-search"
+          ><Icon name="search" size={13} /><input
+            type="search"
+            aria-label="Search objects"
+            bind:value={objectSearch}
+            placeholder="Shape, ID, or state…"
+          /></label
+        >
         <div class="object-list">
-          {#each frame.bodies as object (object.id)}<button
+          {#each visibleObjects as object (object.id)}<button
               class:active={selected === object.id}
               class="object-button"
               onclick={() => {
                 selected = object.id;
-                setTool('select');
+                setTool('select', false);
               }}
               aria-label={`Inspect ${shapeName(object).toLowerCase()} ${object.id}`}
               ><Icon
@@ -1504,6 +2181,7 @@
               ></button
             >{/each}
         </div>
+        {#if !visibleObjects.length}<p class="microcopy">No matching objects.</p>{/if}
       </section>
     </aside>
   </main>
@@ -1519,7 +2197,11 @@
       >
     </div>
     <span class="status-message">A LITTLE CHAOS. A LOT OF PHYSICS.</span><span
-      class="status-version">LOCAL · CLIENT-SIDE</span
+      class="status-version"
+      title={online
+        ? 'All simulation stays on your device.'
+        : 'No connection. The simulation continues locally.'}
+      >{!online ? 'OFFLINE' : offlineReady ? 'OFFLINE READY' : 'LOCAL'} · {autosaveStatus}</span
     >
   </footer>
 </div>
@@ -1531,7 +2213,12 @@
   onchange={importScene}
   aria-label="Choose scene file"
 />
-<dialog bind:this={helpDialog} oncancel={() => (help = false)} class="help-dialog">
+<dialog
+  aria-label="Field guide"
+  bind:this={helpDialog}
+  oncancel={() => (help = false)}
+  class="help-dialog"
+>
   <div class="dialog-header">
     <span class="eyebrow">FIELD GUIDE</span><button
       class="icon-button"
@@ -1552,11 +2239,78 @@
       </div>{/each}
   </div>
   <p class="microcopy">
-    This version uses discrete collisions and a compact sequential impulse solver with sleeping
-    islands. Very fast bodies may tunnel. Scene exports save body state, settings, and joints;
-    preferences such as overlays are remembered in this browser.
+    Fast circles are swept against fixed scenery; other contacts use discrete collision detection.
+    The library and recovery snapshots stay in this browser. Scene links contain the scene itself in
+    the URL fragment. Export JSON for a portable backup; PNG, video, and energy CSV capture your
+    results.
   </p>
   <button class="primary-button" onclick={closeHelp}
     >Back to the experiment <Icon name="arrow" size={16} /></button
   >
+</dialog>
+<dialog
+  aria-label="Saved experiments"
+  class="help-dialog library-dialog"
+  bind:this={libraryDialog}
+  oncancel={() => (libraryOpen = false)}
+>
+  {#if libraryOpen}<Library
+      entries={experiments}
+      defaultName={currentTitle}
+      onsave={saveNamed}
+      onload={openNamed}
+      onremove={deleteNamed}
+      onrename={renameNamed}
+      onexport={(entry) =>
+        download(
+          new Blob([JSON.stringify(entry.scene, null, 2)], { type: 'application/json' }),
+          'poltergeist-scene.json',
+        )}
+      onclose={closeLibrary}
+    />{/if}{#if toast}<p class="dialog-feedback" role="status">{toast}</p>{/if}
+</dialog>
+<dialog
+  aria-label="Share experiment"
+  class="help-dialog share-dialog"
+  bind:this={shareDialog}
+  oncancel={() => (shareOpen = false)}
+>
+  <div class="dialog-header">
+    <span class="eyebrow">TAKE YOUR EXPERIMENT WITH YOU</span><button
+      class="icon-button"
+      onclick={closeShare}
+      aria-label="Close sharing"><Icon name="close" /></button
+    >
+  </div>
+  <h2>Share the physics.</h2>
+  <p>
+    The scene is embedded in the link. Anyone opening it gets an independent copy; it does not sync
+    edits.
+  </p>
+  {#if shareBusy}<p role="status">Packing the experiment…</p>{:else if shareLink}<label
+      class="share-field"
+      >Scene link<textarea
+        readonly
+        value={shareLink}
+        aria-label="Scene link"
+        onclick={(e) => e.currentTarget.select()}></textarea></label
+    ><button class="primary-button" onclick={copyLink}
+      ><Icon name="copy" size={16} />Copy link</button
+    >{:else}<p>Try exporting this experiment as a JSON file instead.</p>{/if}{#if toast}<p
+      class="dialog-feedback"
+      role="status"
+    >
+      {toast}
+    </p>{/if}
+  <p class="microcopy">
+    Use an export instead if the scene contains information you do not want to put in a link.
+  </p>
+</dialog>
+<dialog
+  aria-label="Command menu"
+  class="command-dialog"
+  bind:this={commandDialog}
+  oncancel={() => (commandsOpen = false)}
+>
+  {#if commandsOpen}<CommandPalette {commands} onclose={closeCommands} />{/if}
 </dialog>

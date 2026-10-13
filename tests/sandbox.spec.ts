@@ -222,6 +222,19 @@ test('impulses push from the point on the body, even after it moves', async ({ p
   await page.mouse.click(spot.x, spot.y);
   const placed = (await exportScene(page)).bodies.at(-1) as SceneBody;
   await page.getByRole('button', { name: 'Apply impulse', exact: true }).click();
+  await chamber(page).evaluate((el) => {
+    const state = window as typeof window & { impulseDownX: number; impulseUpX: number };
+    el.addEventListener(
+      'pointerdown',
+      (event) => (state.impulseDownX = (event as PointerEvent).clientX),
+      { once: true },
+    );
+    el.addEventListener(
+      'pointerup',
+      (event) => (state.impulseUpX = (event as PointerEvent).clientX),
+      { once: true },
+    );
+  });
   const press = await toScreen(page, 0, 6);
   await page.mouse.move(press.x, press.y);
   await page.mouse.down();
@@ -236,7 +249,13 @@ test('impulses push from the point on the body, even after it moves', async ({ p
   const pushed = bodyById(await exportScene(page), placed.id);
   expect(pushed.y).toBeLessThan(5.7);
   expect(Math.abs(pushed.omega)).toBeLessThan(0.2);
-  expect(pushed.vx).toBeCloseTo((0.4 * 5) / placed.mass, 1);
+  const distance = await page.evaluate(() => {
+    const state = window as typeof window & { impulseDownX: number; impulseUpX: number };
+    return state.impulseUpX - state.impulseDownX;
+  });
+  // WebKit quantizes mouse coordinates to CSS pixels. Assert against the actual
+  // input event instead of an idealized fractional screen coordinate.
+  expect(pushed.vx).toBeCloseTo(((distance / press.scale) * 5) / placed.mass, 3);
 });
 
 test('joints anchor at the clicked points', async ({ page }) => {

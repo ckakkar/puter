@@ -9,6 +9,8 @@ export interface Prefs {
   placeStatic: boolean;
   sides: number;
   jointKind: JointKind;
+  snapGrid: boolean;
+  smoothMotion: boolean;
 }
 const KEY = 'poltergeist:prefs:v1';
 export const speeds = [0.1, 0.25, 0.5, 1, 2];
@@ -39,6 +41,8 @@ export function loadPrefs(defaults: Prefs): Prefs {
     jointKind: jointKinds.includes(raw.jointKind as JointKind)
       ? (raw.jointKind as JointKind)
       : defaults.jointKind,
+    snapGrid: typeof raw.snapGrid === 'boolean' ? raw.snapGrid : defaults.snapGrid,
+    smoothMotion: typeof raw.smoothMotion === 'boolean' ? raw.smoothMotion : defaults.smoothMotion,
   };
 }
 export function savePrefs(prefs: Prefs) {

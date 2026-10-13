@@ -5,6 +5,7 @@ export interface Checkpoint {
   custom: boolean;
   /** The imported file a custom experiment resets to. */
   initial: string;
+  name?: string;
 }
 interface Entry extends Checkpoint {
   label: string;

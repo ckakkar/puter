@@ -1,0 +1,19 @@
+import { defineConfig, devices } from '@playwright/test';
+export default defineConfig({
+  testDir: './tests',
+  testMatch: 'production.spec.ts',
+  reporter: 'list',
+  use: { baseURL: 'http://127.0.0.1:4173', trace: 'retain-on-failure' },
+  projects: [
+    {
+      name: 'production',
+      use: { ...devices['Desktop Chrome'], viewport: { width: 1440, height: 1000 } },
+    },
+  ],
+  webServer: {
+    command: 'npm run preview -- --port 4173',
+    url: 'http://127.0.0.1:4173',
+    reuseExistingServer: false,
+    timeout: 60000,
+  },
+});

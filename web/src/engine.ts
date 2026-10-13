@@ -75,7 +75,7 @@ export interface Settings {
   sleeping: boolean;
 }
 export const defaultSettings = (): Settings => ({ gravity: 9.81, iterations: 12, sleeping: true });
-export type Tool = 'select' | 'circle' | 'box' | 'polygon' | 'impulse' | 'joint';
+export type Tool = 'select' | 'circle' | 'box' | 'polygon' | 'impulse' | 'joint' | 'measure';
 
 interface Exports extends WebAssembly.Exports {
   memory: WebAssembly.Memory;
@@ -125,9 +125,9 @@ interface Exports extends WebAssembly.Exports {
   frame_len: () => number;
 }
 
-/** Packed frame layout (version 2): a header, then fixed-size records. */
-const FRAME_VERSION = 2;
-const HEADER = 14;
+/** Packed frame layout (version 3): settings included for faithful timeline restores. */
+const FRAME_VERSION = 3;
+const HEADER = 17;
 const BODY = 14;
 const CONTACT = 9;
 const JOINT = 16;
@@ -303,7 +303,7 @@ export function parseScene(raw: unknown): SceneDoc {
       !bodyKeys.every((k) => finite(b[k])) ||
       !Number.isInteger(b.id) ||
       b.id <= 0 ||
-      b.id > 1e9 ||
+      b.id > 16_777_215 ||
       bodies.has(b.id) ||
       ![CIRCLE, BOX, POLYGON].includes(b.kind) ||
       (s.version === 1 && b.kind === POLYGON) ||
@@ -315,7 +315,8 @@ export function parseScene(raw: unknown): SceneDoc {
       !within(b.y, -WORLD_LIMIT, WORLD_LIMIT) ||
       !within(b.vx, -1000, 1000) ||
       !within(b.vy, -1000, 1000) ||
-      !within(b.omega, -1000, 1000)
+      !within(b.omega, -1000, 1000) ||
+      !within(b.angle, -1_000_000, 1_000_000)
     )
       throw new Error('Scene contains an invalid body.');
     bodies.set(b.id, Object.fromEntries(bodyKeys.map((k) => [k, b[k]])) as unknown as SceneBody);
@@ -353,6 +354,7 @@ export function parseScene(raw: unknown): SceneDoc {
       if (
         !Number.isInteger(j.id) ||
         (j.id as number) <= 0 ||
+        (j.id as number) > 16_777_215 ||
         !jointKinds.includes(j.kind as JointKind) ||
         !finite(j.a) ||
         !finite(j.b) ||
@@ -415,7 +417,10 @@ export class Engine {
   settings: Settings = defaultSettings();
   constructor(public api: Exports) {}
   static async load(): Promise<Engine> {
-    const response = await fetch('/poltergeist.wasm');
+    const response = await fetch('/poltergeist.wasm', {
+      cache: 'no-cache',
+      signal: AbortSignal.timeout(15_000),
+    });
     if (!response.ok)
       throw new Error(`Physics engine could not load (${response.status}). Run npm run wasm.`);
     const result = await WebAssembly.instantiate(await response.arrayBuffer());
@@ -430,6 +435,10 @@ export class Engine {
     // Copy immediately: future Rust calls may grow memory or rebuild this buffer.
     const d = new Float32Array(this.api.memory.buffer, ptr, this.api.frame_len()).slice();
     if (d[0] !== FRAME_VERSION) throw new Error('Unsupported physics frame format.');
+    const length = HEADER + d[1] * BODY + d[2] * CONTACT + d[3] * JOINT;
+    if (d.length !== length || d[1] > 256 || d[3] > 256)
+      throw new Error('Invalid physics frame. Reload the app to update its engine.');
+    this.settings = { gravity: d[14], iterations: d[15], sleeping: d[16] !== 0 };
     const f: Frame = {
       ...emptyFrame(),
       time: d[4],

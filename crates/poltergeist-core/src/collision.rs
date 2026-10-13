@@ -56,6 +56,61 @@ pub fn contains(b: &Body, p: Vec2) -> bool {
     }
 }
 
+/// Earliest linear circle hit against a fixed shape, including rounded corners.
+/// The normal points out of the obstacle. Initial overlaps belong to the discrete solver.
+pub fn sweep_circle(start: Vec2, delta: Vec2, radius: f32, obstacle: &Body) -> Option<(f32, Vec2)> {
+    if delta.length_squared() < 1e-12 {
+        return None;
+    }
+    fn circle_hit(start: Vec2, delta: Vec2, center: Vec2, radius: f32) -> Option<(f32, Vec2)> {
+        let offset = start - center;
+        let a = delta.dot(delta);
+        let b = offset.dot(delta);
+        let c = offset.dot(offset) - radius * radius;
+        if c < -1e-6 || b >= 0.0 {
+            return None;
+        }
+        let disc = b * b - a * c;
+        if disc < 0.0 {
+            return None;
+        }
+        let t = (-b - disc.sqrt()) / a;
+        if !(0.0..=1.0).contains(&t) {
+            return None;
+        }
+        Some((t, (start + delta * t - center).normalized()))
+    }
+    if let Shape::Circle { radius: r } = obstacle.shape {
+        return circle_hit(start, delta, obstacle.position, radius + r);
+    }
+    let poly = Poly::of(obstacle);
+    let mut best: Option<(f32, Vec2)> = None;
+    let mut consider = |hit: Option<(f32, Vec2)>| {
+        if let Some(h) = hit {
+            if best.is_none_or(|old| h.0 < old.0) {
+                best = Some(h);
+            }
+        }
+    };
+    for i in 0..poly.count {
+        let vertex = poly.v[i];
+        let normal = poly.n[i];
+        let edge = poly.v[poly.next(i)] - vertex;
+        let approach = delta.dot(normal);
+        let distance = (start - vertex).dot(normal) - radius;
+        if approach < -1e-7 && distance >= -1e-6 {
+            let t = (-distance / approach).max(0.0);
+            let center = start + delta * t;
+            let along = (center - vertex).dot(edge) / edge.length_squared();
+            if t <= 1.0 && (0.0..=1.0).contains(&along) {
+                consider(Some((t, normal)));
+            }
+        }
+        consider(circle_hit(start, delta, vertex, radius));
+    }
+    best
+}
+
 pub fn collide(a: &Body, b: &Body) -> Vec<GeometryContact> {
     match (a.shape, b.shape) {
         (Shape::Circle { radius: ra }, Shape::Circle { radius: rb }) => {

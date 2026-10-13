@@ -6,7 +6,7 @@ use std::cell::RefCell;
 
 /// Ten seconds of ticks at 60 Hz.
 const HISTORY_TICKS: usize = 600;
-const FRAME_VERSION: f32 = 2.0;
+const FRAME_VERSION: f32 = 3.0;
 
 struct Engine {
     world: World,
@@ -229,6 +229,9 @@ pub extern "C" fn frame_ptr() -> *const f32 {
             w.culled as f32,
             h.len() as f32,
             h.cursor() as f32,
+            -w.gravity.y,
+            w.iterations as f32,
+            w.allow_sleep as u32 as f32,
         ]);
         for b in &w.bodies {
             let (kind, a, bsize) = match b.shape {

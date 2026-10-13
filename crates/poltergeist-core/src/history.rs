@@ -1,28 +1,27 @@
 //! A bounded timeline of recent world states for scrubbing back through time.
 //!
-//! Each tick records every body's motion state. Any structural change (adding or
+//! Each tick records the solver state, settings, bodies, and joint state. Any structural change (adding or
 //! removing a body or joint) starts a fresh timeline, because older states no
-//! longer describe the same set of bodies. Contact caches are not recorded, so a
-//! replay resumed from a rewound state can diverge slightly from the original run.
-use crate::{Vec2, World};
-use std::collections::VecDeque;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BodyState {
-    pub position: Vec2,
-    pub angle: f32,
-    pub velocity: Vec2,
-    pub angular_velocity: f32,
-    pub awake: bool,
-    pub sleep_time: f32,
-}
+//! longer describe the same set of bodies. Resuming a checkpoint on the same build
+//! reproduces the original continuation when the subsequent inputs are identical.
+use crate::{Body, Cached, Contact, Joint, MouseJoint, Vec2, World};
+use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub time: f32,
     pub tick: u64,
     pub(crate) version: u64,
-    pub(crate) bodies: Vec<BodyState>,
+    pub(crate) bodies: Vec<Body>,
+    pub(crate) joints: Vec<Joint>,
+    pub(crate) contacts: Vec<Contact>,
+    pub(crate) cache: BTreeMap<(u32, u32, u32), Cached>,
+    pub(crate) gravity: Vec2,
+    pub(crate) iterations: usize,
+    pub(crate) allow_sleep: bool,
+    pub(crate) mouse: Option<MouseJoint>,
+    pub(crate) candidate_pairs: usize,
+    pub(crate) culled: u32,
 }
 
 pub struct History {

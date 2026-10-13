@@ -628,6 +628,123 @@ fn speeds_are_capped() {
     assert!(b.velocity.length() <= MAX_SPEED + 1e-3);
     assert!(b.angular_velocity.abs() <= MAX_ANGULAR_SPEED);
 }
+
+#[test]
+fn fast_circles_do_not_cross_thin_static_scenery() {
+    for shape in [
+        Shape::Box {
+            half: Vec2::new(3.0, 0.015),
+        },
+        Shape::Polygon {
+            radius: 1.5,
+            sides: 4,
+        },
+        Shape::Circle { radius: 0.04 },
+    ] {
+        let mut w = World::new();
+        w.gravity = Vec2::ZERO;
+        w.add(shape, Vec2::ZERO, 0.0);
+        let id = w.add(Shape::Circle { radius: 0.05 }, Vec2::new(0.0, 2.0), 1.0);
+        w.set_motion(id, 0.0, Vec2::new(0.0, -150.0), 0.0);
+        for _ in 0..4 {
+            w.step(DT);
+        }
+        let b = w.body(id).unwrap();
+        assert!(
+            b.position.y > 0.05,
+            "tunneled through {shape:?}: {:?}",
+            b.position
+        );
+        assert!(b.velocity.y >= -0.001);
+    }
+}
+
+#[test]
+fn circle_sweeps_hit_rotated_faces_and_miss_nearby_corners() {
+    let mut box_body = Body::new(
+        1,
+        Shape::Box {
+            half: Vec2::new(1.0, 0.1),
+        },
+        Vec2::ZERO,
+        0.0,
+    );
+    box_body.angle = 0.4;
+    let start = Vec2::new(0.0, 2.0).rotate(0.4);
+    let hit =
+        collision::sweep_circle(start, Vec2::new(0.0, -3.0).rotate(0.4), 0.2, &box_body).unwrap();
+    assert!((hit.0 - (1.7 / 3.0)).abs() < 1e-4);
+    assert!(hit.1.dot(Vec2::new(0.0, 1.0).rotate(0.4)) > 0.999);
+    box_body.angle = 0.0;
+    assert!(
+        collision::sweep_circle(Vec2::new(1.19, 0.5), Vec2::new(0.0, -0.32), 0.2, &box_body)
+            .is_none()
+    );
+}
+
+#[test]
+fn rewound_solver_reproduces_contact_and_joint_continuations() {
+    for scene in [0, 5, 6] {
+        let mut w = World::new();
+        w.load_scene(scene);
+        let mut h = History::new(300);
+        h.sync(&w);
+        for _ in 0..120 {
+            w.step(DT);
+            h.record(&w);
+        }
+        let expected: Vec<_> = w
+            .bodies
+            .iter()
+            .map(|b| {
+                (
+                    b.position,
+                    b.velocity,
+                    b.angle,
+                    b.angular_velocity,
+                    b.awake,
+                    b.sleep_time,
+                )
+            })
+            .collect();
+        assert!(h.seek(&mut w, 60));
+        for _ in 0..60 {
+            w.step(DT);
+        }
+        let actual: Vec<_> = w
+            .bodies
+            .iter()
+            .map(|b| {
+                (
+                    b.position,
+                    b.velocity,
+                    b.angle,
+                    b.angular_velocity,
+                    b.awake,
+                    b.sleep_time,
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected, "scene {scene} diverged");
+    }
+}
+
+#[test]
+fn rewind_restores_properties_and_settings() {
+    let mut w = World::new();
+    let id = w.add(Shape::Circle { radius: 0.5 }, Vec2::new(0.0, 5.0), 1.0);
+    let mut h = History::new(10);
+    h.sync(&w);
+    w.step(DT);
+    h.record(&w);
+    w.set_properties(id, 5.0, 0.9, 0.8);
+    w.configure(Vec2::ZERO, 4, false);
+    h.sync(&w);
+    assert!(h.seek(&mut w, 0));
+    assert_eq!(w.body(id).unwrap().mass, 1.0);
+    assert_eq!(w.gravity, Vec2::new(0.0, -9.81));
+    assert!(w.allow_sleep);
+}
 #[test]
 fn potential_energy_counts_height_and_springs() {
     let mut w = World::new();

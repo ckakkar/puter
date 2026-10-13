@@ -41,6 +41,7 @@ export interface RenderState {
   pin: { x: number; y: number } | null;
   /** Recent positions per body ID, as flat [x0, y0, x1, y1, …] arrays. */
   trails: Map<number, number[]>;
+  measurements?: Segment[];
 }
 
 const palette = ['#e2a46c', '#86b5ae', '#aaa1c2', '#b8b28c'];
@@ -167,6 +168,25 @@ export function render(ctx: CanvasRenderingContext2D, s: RenderState) {
       ctx.textAlign = 'center';
       ctx.fillText(`#${String(b.id).padStart(2, '0')}`, sx(b.x), sy(box.maxY) - 9);
     }
+  }
+  for (const m of s.measurements ?? []) {
+    ctx.save();
+    ctx.setLineDash([4, 4]);
+    line(m.x1, m.y1, m.x2, m.y2, '#b7cad8', 1);
+    ctx.setLineDash([]);
+    dot(m.x1, m.y1, 3, '#b7cad8');
+    dot(m.x2, m.y2, 3, '#b7cad8');
+    const label = `${Math.hypot(m.x2 - m.x1, m.y2 - m.y1).toFixed(2)} m`;
+    ctx.font = '11px ui-monospace,monospace';
+    const width = ctx.measureText(label).width;
+    const x = sx((m.x1 + m.x2) / 2),
+      y = sy((m.y1 + m.y2) / 2) - 12;
+    ctx.fillStyle = '#182329ee';
+    ctx.fillRect(x - width / 2 - 7, y - 12, width + 14, 20);
+    ctx.fillStyle = '#c8dce6';
+    ctx.textAlign = 'center';
+    ctx.fillText(label, x, y + 2);
+    ctx.restore();
   }
   if (s.link) {
     ctx.setLineDash([5, 4]);

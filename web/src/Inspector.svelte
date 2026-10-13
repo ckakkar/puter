@@ -1,6 +1,9 @@
 <script lang="ts" module>
   import type { Body, Contact, Joint, JointKind } from './engine';
   export interface InspectorActions {
+    position: (change: Partial<Pick<Body, 'x' | 'y'>>) => void;
+    velocity: (change: Partial<Pick<Body, 'vx' | 'vy' | 'omega'>>) => void;
+    material: (id: import('./materials').MaterialId) => void;
     property: (key: 'mass' | 'friction' | 'restitution', value: number) => void;
     setStatic: (fixed: boolean) => void;
     rotate: (degrees: number) => void;
@@ -16,6 +19,8 @@
   import Icon from './Icon.svelte';
   import Slider from './Slider.svelte';
   import { BOX, CIRCLE, shapeName } from './engine';
+  import { materials } from './materials';
+  import type { MaterialId } from './materials';
 
   let {
     body,
@@ -120,6 +125,85 @@
     </div>
     <div class="data-row"><span>Size</span><strong>{size}</strong></div>
     <div class="body-properties">
+      <label class="material-label"
+        >Material preset<select
+          aria-label="Body material preset"
+          value=""
+          onchange={(e) => {
+            actions.material(e.currentTarget.value as MaterialId);
+            e.currentTarget.value = '';
+          }}
+          ><option value="" disabled>Apply a preset…</option>{#each materials as material}<option
+              value={material.id}>{material.name}</option
+            >{/each}</select
+        ></label
+      >
+      <details class="motion-editor">
+        <summary>Transform & motion</summary>
+        <Slider
+          id="position-x"
+          label="Position X"
+          value={body.x}
+          min={-20}
+          max={20}
+          inputMin={-250}
+          inputMax={250}
+          step={0.01}
+          unit="m"
+          onchange={(v) => actions.position({ x: v })}
+        />
+        <Slider
+          id="position-y"
+          label="Position Y"
+          value={body.y}
+          min={-10}
+          max={20}
+          inputMin={-50}
+          inputMax={250}
+          step={0.01}
+          unit="m"
+          onchange={(v) => actions.position({ y: v })}
+        />
+        <Slider
+          id="velocity-x"
+          label="Velocity X"
+          value={body.vx}
+          min={-20}
+          max={20}
+          inputMin={-150}
+          inputMax={150}
+          step={0.1}
+          unit="m/s"
+          onchange={(v) => actions.velocity({ vx: v })}
+        />
+        <Slider
+          id="velocity-y"
+          label="Velocity Y"
+          value={body.vy}
+          min={-20}
+          max={20}
+          inputMin={-150}
+          inputMax={150}
+          step={0.1}
+          unit="m/s"
+          onchange={(v) => actions.velocity({ vy: v })}
+        />
+        <Slider
+          id="angular-motion"
+          label="Spin"
+          value={body.omega}
+          min={-20}
+          max={20}
+          inputMin={-200}
+          inputMax={200}
+          step={0.1}
+          unit="rad/s"
+          onchange={(v) => actions.velocity({ omega: v })}
+        />
+        <button class="text-button" onclick={() => actions.velocity({ vx: 0, vy: 0, omega: 0 })}
+          >Stop motion</button
+        >
+      </details>
       <label class="toggle-row static-toggle"
         ><span class="overlay-dot"></span><span>Static (immovable)</span><input
           type="checkbox"

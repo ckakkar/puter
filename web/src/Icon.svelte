@@ -1,6 +1,16 @@
 <script lang="ts">
   let { name, size = 18 }: { name: string; size?: number } = $props();
   const paths: Record<string, string> = {
+    save: 'M4 3h13l3 3v15H4ZM8 3v6h8V3M8 21v-8h8v8',
+    folder: 'M3 6h7l2 3h9v11H3V6Z',
+    search: 'M16 10a6 6 0 1 1-12 0 6 6 0 0 1 12 0Zm-1 5 6 6',
+    share:
+      'M18 5 6 11m0 2 12 6M8 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0ZM22 4a3 3 0 1 1-6 0 3 3 0 0 1 6 0ZM22 20a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z',
+    edit: 'm5 16 11-11 3 3-11 11-5 2 2-5Z',
+    measure: 'm3 15 12-12 6 6-12 12-6-6Zm5-5 3 3m0-6 3 3',
+    command: 'M9 7V5a2 2 0 1 0-2 2h10a2 2 0 1 0-2-2v14a2 2 0 1 0 2-2H7a2 2 0 1 0 2 2V7Z',
+    fullscreen: 'M3 9V3h6m6 0h6v6M3 15v6h6m6 0h6v-6',
+    video: 'M3 6h12v12H3ZM15 10l6-3v10l-6-3',
     play: 'm8 5 11 7-11 7V5Z',
     pause: 'M8 5v14M16 5v14',
     step: 'm5 5 10 7-10 7V5ZM19 5v14',

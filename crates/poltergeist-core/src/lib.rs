@@ -8,7 +8,7 @@ mod scenes;
 #[cfg(test)]
 mod tests;
 
-use history::{BodyState, Snapshot};
+use history::Snapshot;
 pub use joint::{Joint, JointKind, MAX_JOINTS};
 use math::angular_velocity;
 pub use math::Vec2;
@@ -17,6 +17,8 @@ use std::collections::BTreeMap;
 use std::f32::consts::PI;
 
 pub const MAX_BODIES: usize = 256;
+/// IDs cross the render ABI as f32, which represents integers exactly only up to 2^24.
+pub const MAX_ID: u32 = 16_777_215;
 pub const MIN_SIDES: u32 = 3;
 pub const MAX_SIDES: u32 = 8;
 /// Dynamic bodies that travel this far from the origin have left the laboratory.
@@ -180,8 +182,8 @@ pub struct MouseJoint {
     pub local_anchor: Vec2,
     pub target: Vec2,
 }
-#[derive(Clone, Copy)]
-struct Cached {
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Cached {
     normal: Vec2,
     normal_impulse: f32,
     tangent_impulse: f32,
@@ -272,7 +274,7 @@ impl World {
             return 0;
         }
         let id = if id == 0 { self.next_id } else { id };
-        if id == u32::MAX || self.index_of(id).is_some() {
+        if id > MAX_ID || self.index_of(id).is_some() {
             return 0;
         }
         let at = self.bodies.partition_point(|b| b.id < id);
@@ -482,7 +484,7 @@ impl World {
             };
         let dynamic = |id: u32| self.body(id).is_some_and(|b| b.is_dynamic());
         if self.joints.len() >= MAX_JOINTS
-            || id == u32::MAX
+            || id > MAX_ID
             || self.joints.iter().any(|j| j.id == id)
             || a == b
             || self.body(a).is_none()
@@ -698,9 +700,69 @@ impl World {
             b.angular_velocity = b
                 .angular_velocity
                 .clamp(-MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED);
-            b.position += b.velocity * dt;
             b.angle += b.angular_velocity * dt;
         }
+        // Sweep translating circles against fixed scenery. Boxes/polygons and
+        // dynamic-dynamic collisions still use discrete manifolds.
+        for i in 0..self.bodies.len() {
+            if !self.bodies[i].is_active() {
+                continue;
+            }
+            let Shape::Circle { radius } = self.bodies[i].shape else {
+                let velocity = self.bodies[i].velocity;
+                self.bodies[i].position += velocity * dt;
+                continue;
+            };
+            // For normal, slow motion, retain the standard solver path.
+            if self.bodies[i].velocity.length() * dt < radius * 0.5 {
+                let velocity = self.bodies[i].velocity;
+                self.bodies[i].position += velocity * dt;
+                continue;
+            }
+            let mut remaining = dt;
+            for _ in 0..4 {
+                let start = self.bodies[i].position;
+                let delta = self.bodies[i].velocity * remaining;
+                let mut hit: Option<(f32, Vec2, usize)> = None;
+                for (j, obstacle) in self.bodies.iter().enumerate() {
+                    if obstacle.is_dynamic() {
+                        continue;
+                    }
+                    if let Some((t, n)) = collision::sweep_circle(start, delta, radius, obstacle) {
+                        if hit.is_none_or(|h| t < h.0) {
+                            hit = Some((t, n, j));
+                        }
+                    }
+                }
+                let Some((fraction, normal, j)) = hit else {
+                    self.bodies[i].position += delta;
+                    break;
+                };
+                let bounce = self.bodies[i].restitution.min(self.bodies[j].restitution);
+                self.bodies[i].position = start + delta * fraction + normal * 0.0001;
+                let vn = self.bodies[i].velocity.dot(normal);
+                if vn < 0.0 {
+                    self.bodies[i].velocity -= normal * ((1.0 + bounce) * vn);
+                    let (a, b) = (i.min(j), i.max(j));
+                    contacts.push(Contact {
+                        a,
+                        b,
+                        point: self.bodies[i].position - normal * radius,
+                        normal: if a == i { -normal } else { normal },
+                        penetration: 0.0,
+                        normal_impulse: -(1.0 + bounce) * vn * self.bodies[i].mass,
+                        tangent_impulse: 0.0,
+                        feature: u32::MAX,
+                        target_velocity: 0.0,
+                    });
+                }
+                remaining *= 1.0 - fraction;
+                if remaining < 1e-6 {
+                    break;
+                }
+            }
+        }
+        contacts.sort_by_key(|c| (c.a, c.b, c.feature));
         // Separate positional projection limits energy introduced by overlap correction.
         // A manifold's points are consecutive, so each pair is corrected once per pass.
         for _ in 0..4 {
@@ -909,39 +971,37 @@ impl World {
         gravity + springs
     }
 
-    pub(crate) fn capture(&self, mut into: Vec<BodyState>) -> Snapshot {
-        into.clear();
-        into.extend(self.bodies.iter().map(|b| BodyState {
-            position: b.position,
-            angle: b.angle,
-            velocity: b.velocity,
-            angular_velocity: b.angular_velocity,
-            awake: b.awake,
-            sleep_time: b.sleep_time,
-        }));
+    pub(crate) fn capture(&self, mut into: Vec<Body>) -> Snapshot {
+        into.clone_from(&self.bodies);
         Snapshot {
             time: self.time,
             tick: self.tick,
             version: self.version,
             bodies: into,
+            joints: self.joints.clone(),
+            contacts: self.contacts.clone(),
+            cache: self.cache.clone(),
+            gravity: self.gravity,
+            iterations: self.iterations,
+            allow_sleep: self.allow_sleep,
+            mouse: self.mouse,
+            candidate_pairs: self.candidate_pairs,
+            culled: self.culled,
         }
     }
     pub(crate) fn restore(&mut self, s: &Snapshot) {
-        for (b, state) in self.bodies.iter_mut().zip(&s.bodies) {
-            b.position = state.position;
-            b.angle = state.angle;
-            b.velocity = state.velocity;
-            b.angular_velocity = state.angular_velocity;
-            b.awake = state.awake;
-            b.sleep_time = state.sleep_time;
-        }
+        self.bodies.clone_from(&s.bodies);
+        self.joints.clone_from(&s.joints);
+        self.contacts.clone_from(&s.contacts);
+        self.cache.clone_from(&s.cache);
+        self.gravity = s.gravity;
+        self.iterations = s.iterations;
+        self.allow_sleep = s.allow_sleep;
+        self.mouse = s.mouse;
+        self.candidate_pairs = s.candidate_pairs;
+        self.culled = s.culled;
         self.time = s.time;
         self.tick = s.tick;
-        self.mouse = None;
-        for j in &mut self.joints {
-            joint::reset(j);
-        }
-        self.refresh_contacts();
     }
 }
 fn solve_contact(bodies: &mut [Body], c: &mut Contact) {
